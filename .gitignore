@@ -1,0 +1,11 @@
+/target/
+
+.DS_Store
+*.suo
+*.user
+*.user.*
+*.sln.docstates
+*.cache
+*~
+*.swp
+*.bak
