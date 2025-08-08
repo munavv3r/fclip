@@ -1,10 +1,23 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 
 use anyhow::Result;
 use clap::Parser;
 use ignore::{WalkBuilder, types::TypesBuilder};
 use glob::Pattern;
+
+fn is_likely_binary(bytes: &[u8]) -> bool {
+    let sample_size = bytes.len().min(1024);
+    let sample = &bytes[0..sample_size];
+    
+    let null_count = sample.iter().filter(|&&b| b == 0).count();
+    let non_printable_count = sample.iter()
+        .filter(|&&b| b < 32 && b != 9 && b != 10 && b != 13)
+        .count();
+    
+    null_count > 0 || (non_printable_count as f32 / sample_size as f32) > 0.3
+}
 
 const AFTER_HELP: &str = "\
 EXAMPLES:
@@ -53,8 +66,93 @@ struct Cli {
 
     #[arg(short, long, value_delimiter = ',')]
     exclude: Option<Vec<String>>,
+
     #[arg(long, short)]
     verbose: bool,
+    
+    #[arg(long)]
+    dry_run: bool,
+
+    #[arg(long, default_value_t = 10)]
+    max_size_mb: usize,
+
+    #[arg(long, value_enum, default_value_t = OutputFormat::Default)]
+    format: OutputFormat,
+
+    #[arg(long)]
+    stats: bool,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum OutputFormat {
+    Default,
+    Markdown,
+    Json,
+}
+
+fn format_output(files: &[(PathBuf, String)], format: &OutputFormat) -> String {
+    match format {
+        OutputFormat::Default => {
+            let mut output = String::new();
+            for (path, content) in files {
+                output.push_str(&format!("--- {} ---\n", path.display()));
+                output.push_str(content);
+                if !content.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push('\n');
+            }
+            output
+        }
+        OutputFormat::Markdown => {
+            let mut output = String::new();
+            for (path, content) in files {
+                output.push_str(&format!("## {}\n\n", path.display()));
+                
+                let ext = path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                
+                let lang = match ext {
+                    "rs" => "rust",
+                    "py" => "python", 
+                    "js" => "javascript",
+                    "ts" => "typescript",
+                    "html" => "html",
+                    "css" => "css",
+                    "json" => "json",
+                    "toml" => "toml",
+                    "yml" | "yaml" => "yaml",
+                    "md" => "markdown",
+                    "sh" => "bash",
+                    "ps1" => "powershell",
+                    _ => "",
+                };
+                
+                output.push_str(&format!("```{}\n", lang));
+                output.push_str(content);
+                if !content.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push_str("```\n\n");
+            }
+            output
+        }
+        OutputFormat::Json => {
+            let files_json: Vec<serde_json::Value> = files.iter()
+                .map(|(path, content)| {
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "content": content
+                    })
+                })
+                .collect();
+            
+            serde_json::to_string_pretty(&serde_json::json!({
+                "files": files_json
+            })).unwrap_or_else(|_| "Error formatting JSON".to_string())
+        }
+    }
 }
 
 fn should_unignore_file(path: &Path, unignore_patterns: &[Pattern], verbose: bool) -> bool {
@@ -88,11 +186,41 @@ fn should_unignore_file(path: &Path, unignore_patterns: &[Pattern], verbose: boo
     false
 }
 
+fn print_stats(files_data: &[(PathBuf, String)], total_size: usize) {
+    let mut ext_counts: HashMap<String, usize> = HashMap::new();
+    let mut ext_sizes: HashMap<String, usize> = HashMap::new();
+    let mut total_lines = 0;
+    
+    for (path, content) in files_data {
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("(no extension)")
+            .to_string();
+        
+        *ext_counts.entry(ext.clone()).or_insert(0) += 1;
+        *ext_sizes.entry(ext).or_insert(0) += content.len();
+        total_lines += content.lines().count();
+    }
+    
+    eprintln!("Total files: {}", files_data.len());
+    eprintln!("Total size: {:.1} KB", total_size as f64 / 1024.0);
+    eprintln!("Total lines: {}", total_lines);
+    eprintln!("\nBy file type:");
+    
+    let mut ext_data: Vec<_> = ext_counts.iter().collect();
+    ext_data.sort_by_key(|&(_, count)| std::cmp::Reverse(*count));
+    
+    for (ext, count) in ext_data {
+        let size_kb = ext_sizes[ext] as f64 / 1024.0;
+        eprintln!("  {}: {} files ({:.1} KB)", ext, count, size_kb);
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut output_buffer = String::new();
-    let mut files_copied = 0;
-
+    let mut files_data = Vec::new();
+    let mut total_size_bytes = 0usize;
+    let max_size_bytes = cli.max_size_mb * 1024 * 1024;
     let unignore_patterns: Result<Vec<Pattern>, _> = cli.unignore
         .as_ref()
         .map(|patterns| {
@@ -175,7 +303,7 @@ fn main() -> Result<()> {
                 
                 if entry.file_type().map_or(false, |ft| ft.is_file()) {
                     let file_path = entry.path().to_path_buf();
-
+                    
                     if !found_files.contains(&file_path) {
                         if should_unignore_file(&file_path, &unignore_patterns, cli.verbose) {
                             found_files.insert(file_path);
@@ -194,27 +322,74 @@ fn main() -> Result<()> {
             }
             
             match fs::read_to_string(&file_path) {
-                Ok(content) => {
-                    output_buffer.push_str(&format!("--- {} ---\n", file_path.display()));
-                    output_buffer.push_str(&content);
-                    output_buffer.push_str("\n\n");
-                    files_copied += 1;
+                Ok(mut content) => {
+
+                    if content.starts_with('\u{FEFF}') {
+                        content = content.trim_start_matches('\u{FEFF}').to_string();
+                    }
+                    
+                    content = content.replace("\r\n", "\n");
+                    
+                    let content_size = content.len();
+                    
+                    if total_size_bytes + content_size > max_size_bytes {
+                        eprintln!("Warning: Skipping {} - would exceed size limit of {}MB", 
+                                file_path.display(), cli.max_size_mb);
+                        continue;
+                    }
+                    
+                    total_size_bytes += content_size;
+                    files_data.push((file_path.clone(), content));
                     
                     if cli.verbose {
-                        eprintln!("Copied: {}", file_path.display());
+                        eprintln!("Added: {} ({} bytes)", file_path.display(), content_size);
                     }
                 }
                 Err(e) => {
-                    eprintln!("Warning: Skipping file {}: {}", file_path.display(), e);
+                    if let Ok(bytes) = fs::read(&file_path) {
+                        if is_likely_binary(&bytes) {
+                            if cli.verbose {
+                                eprintln!("Skipping binary file: {}", file_path.display());
+                            }
+                        } else {
+                            eprintln!("Warning: File {} appears to be text but has encoding issues: {}", file_path.display(), e);
+                        }
+                    } else {
+                        eprintln!("Warning: Cannot read file {}: {}", file_path.display(), e);
+                    }
                 }
             }
         }
     }
 
-    if files_copied > 0 {
-        let mut clipboard = arboard::Clipboard::new()?;
-        clipboard.set_text(output_buffer)?;
-        eprintln!("Copied content of {} file(s) to clipboard.", files_copied);
+    if !files_data.is_empty() {
+        let formatted_output = format_output(&files_data, &cli.format);
+        
+        if cli.dry_run {
+            eprintln!("=== DRY RUN - Would copy {} file(s) ({:.1} KB) ===", 
+                     files_data.len(), total_size_bytes as f64 / 1024.0);
+            
+            for (path, content) in &files_data {
+                let lines = content.lines().count();
+                eprintln!("  {} ({} lines, {} bytes)", 
+                         path.display(), lines, content.len());
+            }
+            
+            if cli.stats {
+                eprintln!("\n=== STATISTICS ===");
+                print_stats(&files_data, total_size_bytes);
+            }
+        } else {
+            let mut clipboard = arboard::Clipboard::new()?;
+            clipboard.set_text(formatted_output)?;
+            eprintln!("Copied content of {} file(s) to clipboard ({:.1} KB).", 
+                     files_data.len(), total_size_bytes as f64 / 1024.0);
+            
+            if cli.stats {
+                eprintln!("\n=== STATISTICS ===");
+                print_stats(&files_data, total_size_bytes);
+            }
+        }
     } else {
         eprintln!("No files found matching the criteria.");
     }
