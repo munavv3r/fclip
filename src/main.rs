@@ -66,52 +66,66 @@ fn should_auto_exclude(path: &Path) -> bool {
 }
 
 fn compress_content(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
     let mut result = String::new();
-    let mut in_string = false;
-    let mut string_char = '"';
-    let mut prev_char = '\0';
-    let mut consecutive_spaces = 0;
     
-    for ch in content.chars() {
-        match ch {
-            '"' | '\'' if prev_char != '\\' => {
-                if !in_string {
-                    in_string = true;
-                    string_char = ch;
-                } else if ch == string_char {
-                    in_string = false;
-                }
-                result.push(ch);
-                consecutive_spaces = 0;
-            }
-            ' ' if !in_string => {
-                consecutive_spaces += 1;
-                if consecutive_spaces == 1 {
-                    result.push(' ');
-                }
-            }
-            '\t' if !in_string => {
-                if consecutive_spaces == 0 {
-                    result.push(' ');
-                    consecutive_spaces = 1;
-                }
-            }
-            '\n' => {
-                while result.ends_with(' ') {
-                    result.pop();
-                }
-                result.push('\n');
-                consecutive_spaces = 0;
-            }
-            '\r' => {
-                consecutive_spaces = 0;
-            }
-            _ => {
-                result.push(ch);
-                consecutive_spaces = 0;
-            }
+    for line in lines {
+        if line.trim().is_empty() {
+            result.push('\n');
+            continue;
         }
-        prev_char = ch;
+        
+        let leading_whitespace_end = line.chars()
+            .position(|c| c != ' ' && c != '\t')
+            .unwrap_or(line.len());
+        
+        let indentation = &line[..leading_whitespace_end];
+        let content_part = &line[leading_whitespace_end..];
+        
+        result.push_str(indentation);
+        
+        let mut prev_space = false;
+        let mut in_string = false;
+        let mut string_char = '"';
+        let mut prev_char = '\0';
+        
+        for ch in content_part.chars() {
+            match ch {
+                '"' | '\'' if prev_char != '\\' => {
+                    if !in_string {
+                        in_string = true;
+                        string_char = ch;
+                    } else if ch == string_char {
+                        in_string = false;
+                    }
+                    result.push(ch);
+                    prev_space = false;
+                }
+                ' ' if !in_string => {
+                    if !prev_space {
+                        result.push(' ');
+                        prev_space = true;
+                    }
+                }
+                '\t' if !in_string => {
+                    if !prev_space {
+                        result.push(' ');
+                        prev_space = true;
+                    }
+                }
+                _ => {
+                    result.push(ch);
+                    prev_space = false;
+                }
+            }
+            prev_char = ch;
+        }
+        
+        result.push('\n');
+    }
+    
+    if !content.ends_with('\n') && result.ends_with('\n') {
+        result.pop();
     }
     
     while result.contains("\n\n\n") {
@@ -120,6 +134,7 @@ fn compress_content(content: &str) -> String {
     
     result
 }
+
 
 fn generate_directory_tree(paths: &[PathBuf], max_depth: Option<usize>) -> String {
     let mut tree = String::from("## Project Structure\n\n```\n");
@@ -409,20 +424,36 @@ enum OutputFormat {
 }
 
 fn parse_size(size_str: &str) -> Result<usize> {
-    let size_str = size_str.to_lowercase();
-    let (num_str, unit) = if size_str.ends_with("kb") {
-        (size_str.trim_end_matches("kb"), 1024)
+    let size_str = size_str.to_lowercase().replace(" ", "");
+    
+    let (num_str, multiplier) = if size_str.ends_with("gb") {
+        (size_str.trim_end_matches("gb"), 1024 * 1024 * 1024)
     } else if size_str.ends_with("mb") {
         (size_str.trim_end_matches("mb"), 1024 * 1024)
-    } else if size_str.ends_with("gb") {
-        (size_str.trim_end_matches("gb"), 1024 * 1024 * 1024)
+    } else if size_str.ends_with("kb") {
+        (size_str.trim_end_matches("kb"), 1024)
+    } else if size_str.ends_with("b") {
+        (size_str.trim_end_matches("b"), 1)
     } else {
         (size_str.as_str(), 1)
     };
     
-    let num: usize = num_str.parse().map_err(|_| anyhow::anyhow!("Invalid size format"))?;
-    Ok(num * unit)
+    let num: f64 = num_str.parse()
+        .map_err(|_| anyhow::anyhow!("Invalid size format: '{}'", size_str))?;
+    
+    if num < 0.0 {
+        return Err(anyhow::anyhow!("Size cannot be negative"));
+    }
+    
+    let result = (num * multiplier as f64) as usize;
+    
+    if result == 0 && num > 0.0 {
+        Ok(1)
+    } else {
+        Ok(result)
+    }
 }
+
 
 fn write_output_chunks(content: &str, output_file: &Path, chunk_size: usize, append: bool) -> Result<()> {
     if content.len() <= chunk_size {
@@ -678,6 +709,13 @@ fn print_stats(files_data: &[(PathBuf, String)], total_size: usize, total_tokens
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    
+    let output_file_canonical = if let Some(ref output_file) = cli.output_file {
+        output_file.canonicalize().ok()
+    } else {
+        None
+    };
+    
     let mut files_data = Vec::new();
     let mut total_size_bytes = 0usize;
     let mut total_tokens = 0usize;
@@ -788,6 +826,17 @@ fn main() -> Result<()> {
         file_paths.sort();
 
         for file_path in file_paths {
+            if let Some(ref output_canonical) = output_file_canonical {
+                if let Ok(file_canonical) = file_path.canonicalize() {
+                    if file_canonical == *output_canonical {
+                        if cli.verbose {
+                            eprintln!("Skipping output file: {}", file_path.display());
+                        }
+                        continue;
+                    }
+                }
+            }
+
             if cli.verbose {
                 eprintln!("Processing: {}", file_path.display());
             }
