@@ -107,7 +107,7 @@ fn compress_content(content: &str) -> String {
         let indentation = &line[..leading_whitespace_end];
         let content_part = &line[leading_whitespace_end..];
         
-        result.push_str(indentation);
+        result.push_str(&indentation.replace('\t', " "));
         
         let mut prev_space = false;
         let mut in_string = false;
@@ -146,6 +146,9 @@ fn compress_content(content: &str) -> String {
             prev_char = ch;
         }
         
+        while result.ends_with(' ') {
+            result.pop();
+        }
         result.push('\n');
     }
     
@@ -851,11 +854,24 @@ fn main() -> Result<()> {
         file_paths.sort();
 
         for file_path in file_paths {
-            if let Some(ref output_canonical) = output_file_canonical {
-                if let Ok(file_canonical) = file_path.canonicalize() {
-                    if file_canonical == *output_canonical {
+            if let Some(output_file) = &cli.output_file {
+                if let Some(ref output_canonical) = output_file_canonical {
+                    if let Ok(file_canonical) = file_path.canonicalize() {
+                        if file_canonical == *output_canonical {
+                            if cli.verbose {
+                                eprintln!("Skipping output file: {}", file_path.display());
+                            }
+                            continue;
+                        }
+                    }
+                }
+                
+                if cli.split_by_size.is_some() {
+                    let base_name = output_file.file_stem().unwrap_or_default().to_string_lossy();
+                    let current_file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
+                    if !base_name.is_empty() && current_file_name.starts_with(&*base_name) && current_file_name.contains("_part_") {
                         if cli.verbose {
-                            eprintln!("Skipping output file: {}", file_path.display());
+                            eprintln!("Skipping chunked output file: {}", file_path.display());
                         }
                         continue;
                     }
