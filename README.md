@@ -113,18 +113,3 @@ To see all available commands and options, run:
 ```sh
 fclip --help
 ```
-
-## All Options
-
-- `--include (-i)`: Comma-separated list of file extensions to include. Default: (all).
-- `--exclude (-e)`: Comma-separated list of file extensions to exclude. Default: (none).
-- `--depth`: Max depth to search for files. Default: (none).
-- `--unignore`: Comma-separated list of glob patterns to un-ignore. Default: (none).
-- `--use-gitignore`: Whether to respect .gitignore files. Default: true.
-- `--format`: Output format (default, markdown, json). Default: default.
-- `--max-size-mb`: Maximum total size of content to copy in megabytes. Default: 10.
-- `--dry-run`: List files that would be copied without action. Default: false.
-- `--stats`: Show statistics about the copied files. Default: false.
-- `--verbose (-v)`: Enable verbose logging during processing. Default: false.
-- `--help (-h)`: Show the help message.
-- `--version (-V)`: Show the application version.
