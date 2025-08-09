@@ -1,87 +1,130 @@
 # fclip
 
-`fclip` is a CLI tool written in Rust that recursively reads the contents of specified files from a given directory and copies them to your clipboard as a single block of text.
-
-The main goal is to help users easily dump massive amounts of files into LLMs for context.
+A powerful CLI tool to recursively copy file contents to your clipboard, supercharged for LLM context.
 
 ---
 
-## ✨ Features
+`fclip` is a command-line tool written in Rust that walks a directory, reads the contents of relevant files, and copies them to your clipboard as a single, formatted block of text.
 
--   **Blazing Fast:** Written in Rust for maximum performance and efficiency, even on large codebases.
--   **Recursive Copy:** Scans a directory and all its subdirectories to gather files.
--   **Smart Filtering:** Easily include or exclude files by their extension (e.g., `copy only .rs and .toml files`).
--   **Intelligent Ignoring:** Automatically skips version control directories (`.git`), build artifacts (`target/`, `node_modules/`), and hidden dotfiles by default to keep the output clean.
--   **Single Binary:** Compiles to a single, dependency-free executable that you can place anywhere on your system.
+Its primary goal is to make it effortless to provide large amounts of code or text as context to Large Language Models (LLMs).
 
-## 🚀 Installation
+## Features
+
+- **Powerful Content Aggregation**: Recursively scans directories to gather file contents into a single text block.
+- **Intelligent Filtering**:
+  - Respects `.gitignore`, `.ignore`, and other global ignore files by default.
+  - Precisely `--include` or `--exclude` files by extension.
+  - Ability to `--unignore` specific files or patterns that would normally be ignored.
+- **Advanced Control**:
+  - Limit recursion with `--depth` to avoid going too deep into directories.
+  - Set a `--max-size-mb` limit to prevent accidentally copying enormous projects.
+  - Perform a `--dry-run` to see which files *would* be copied without actually touching the clipboard.
+- **Flexible Output Formatting**:
+  - Choose between `default`, `markdown` (with code blocks), and `json` formats using the `--format` flag.
+- **Smart & Safe**:
+  - Automatically detects and skips binary files.
+  - Provides detailed file statistics with the `--stats` flag.
+- **Performant & Portable**:
+  - Written in Rust for maximum speed, even on large codebases.
+  - Compiles to a single, dependency-free binary.
+
+## Installation
 
 You must have the [Rust toolchain](https://rustup.rs/) installed to build from source.
 
-### Recommended Method (via `cargo install`)
+The recommended method is to install directly with `cargo`, which builds the optimized binary and makes it available in your system's PATH.
 
-This will build the optimized binary and place it in your Cargo binary path, making it available everywhere.
+1. Clone the repository:
+   ```sh
+   git clone https://github.com/munavv3r/fclip.git
+   cd fclip
+   ```
 
-1.  Clone this repository:
-    ```sh
-    git clone https://github.com/munavv3r/fclip.git
-    cd fclip
-    ```
+2. Install using `cargo`:
+   ```sh
+   cargo install --path .
+   ```
 
-2.  Install using `cargo`:
-    ```sh
-    cargo install --path .
-    ```
-
-After installation, restart your terminal and the `fclip` command will be available.
+After installation, restart your terminal or source your shell profile, and the `fclip` command will be available.
 
 ## Usage
 
-The basic syntax is `fclip [OPTIONS] [PATH]`. If no path is provided, it defaults to the current directory (`.`).
+The basic syntax is `fclip [OPTIONS] [PATHS...]`. If no path is provided, it defaults to the current directory (`.`).
 
-### Copy an Entire Project
-
-This will copy all supported files from the current directory and its subdirectories.
-```sh
-fclip .
-```
-
-### Copy Files from a Specific Folder
+### Basic Examples
 
 ```sh
+# Copy all relevant files from the current directory
+fclip
+
+# Copy files from a specific directory
 fclip ./src
+
+# Copy files from multiple locations at once
+fclip ./src ./docs
 ```
 
-### Copy Only Specific File Types
-
-Use the `-i` or `--include` flag with a comma-separated list of extensions. The leading dot is optional.
+### Filtering Files
 
 ```sh
-# Copy only Rust and TOML files
+# Copy only Rust and Toml files
 fclip --include rs,toml .
+
+# Copy all files except .log and .tmp files
+fclip --exclude log,tmp
+
+# Include all '.md' files, but exclude 'NOTE.md'
+fclip --include md --exclude NOTE.md
 ```
 
-### Exclude Specific File Types
-
-Use the `-e` or `--exclude` flag. This is useful for ignoring minified files or logs.
+### Controlling the Walk
 
 ```sh
-# Copy all files except .lock files
-fclip --exclude lock .
+# Copy files, but go no deeper than 2 directories from the starting point
+fclip --depth 2 .
+
+# Explicitly include the '.env.example' file, even if it's in .gitignore
+fclip --unignore .env.example
+
+# You can also use glob patterns to un-ignore files
+fclip --unignore '*.md'
 ```
 
-### Combine Filters
-
-You can use include and exclude flags together for more precise control. For example, to copy all `.js` files except for `.min.js`:
+### Output and Safety
 
 ```sh
-fclip --include js --exclude min.js .
+# Format the output as Markdown with language-tagged code blocks
+fclip --format markdown .
+
+# Perform a dry run to see what files would be copied, without modifying the clipboard
+fclip --dry-run
+
+# Show detailed statistics about the files being copied
+fclip --stats
+
+# Set a maximum total size of 5MB for the copied content
+fclip --max-size-mb 5
 ```
 
-### Get Help
+### Getting Help
 
-See all available options and commands by running:
+To see all available commands and options, run:
 
 ```sh
 fclip --help
 ```
+
+## All Options
+
+- `--include (-i)`: Comma-separated list of file extensions to include. Default: (all).
+- `--exclude (-e)`: Comma-separated list of file extensions to exclude. Default: (none).
+- `--depth`: Max depth to search for files. Default: (none).
+- `--unignore`: Comma-separated list of glob patterns to un-ignore. Default: (none).
+- `--use-gitignore`: Whether to respect .gitignore files. Default: true.
+- `--format`: Output format (default, markdown, json). Default: default.
+- `--max-size-mb`: Maximum total size of content to copy in megabytes. Default: 10.
+- `--dry-run`: List files that would be copied without action. Default: false.
+- `--stats`: Show statistics about the copied files. Default: false.
+- `--verbose (-v)`: Enable verbose logging during processing. Default: false.
+- `--help (-h)`: Show the help message.
+- `--version (-V)`: Show the application version.
