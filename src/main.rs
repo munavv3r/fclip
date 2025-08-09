@@ -2,24 +2,60 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::{Arc};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
 use clap::Parser;
-use ignore::{WalkBuilder, types::TypesBuilder};
 use glob::Pattern;
+use ignore::{WalkBuilder, types::TypesBuilder};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use serde_json::Value;
 
 fn estimate_tokens(text: &str) -> usize {
-
-    let chars = text.len();
-    let words = text.split_whitespace().count();
-
-    if chars == 0 { return 0; }
+    if text.is_empty() {
+        return 0;
+    }
     
-    let avg_word_length = chars as f32 / words.max(1) as f32;
-    let code_factor = if avg_word_length < 6.0 { 1.2 } else { 1.0 };
+    let chars = text.chars().count();
+    let bytes = text.len();
+
+    let mut ascii_chars = 0;
+    let mut whitespace_chars = 0;
+    let mut punctuation_chars = 0;
+    let mut unicode_chars = 0;
+    let mut newlines = 0;
     
-    ((chars as f32 / 4.0) * code_factor) as usize
+    for ch in text.chars() {
+        match ch {
+            '\n' => newlines += 1,
+            c if c.is_ascii_whitespace() => whitespace_chars += 1,
+            c if c.is_ascii_punctuation() => punctuation_chars += 1,
+            c if c.is_ascii() => ascii_chars += 1,
+            _ => unicode_chars += 1,
+        }
+    }
+    
+    let base_tokens = (ascii_chars as f64 * 0.75) +
+                     (whitespace_chars as f64 * 0.25) +
+                     (punctuation_chars as f64 * 1.0) +
+                     (unicode_chars as f64 * 1.5) +
+                     (newlines as f64 * 1.0);
+    
+    let code_indicators = text.matches(&['{', '}', '(', ')', '[', ']', ';', '=', '"']).count();
+    let code_factor = if code_indicators > chars / 20 { 1.3 } else { 1.0 };
+
+    let length_factor = if chars > 10000 { 0.95 } else if chars > 1000 { 1.0 } else { 1.1 };
+
+    let complexity_factor = (bytes as f64 / chars.max(1) as f64) * 0.1 + 0.9;
+    
+    let estimated = base_tokens * code_factor * length_factor * complexity_factor;
+    
+    let min_estimate = chars / 6;
+    let max_estimate = chars * 2;
+    
+    (estimated as usize).max(min_estimate).min(max_estimate)
 }
 
 fn is_likely_binary(bytes: &[u8]) -> bool {
@@ -508,7 +544,7 @@ fn format_output(files: &[(PathBuf, String)], format: &OutputFormat, cli: &Cli) 
         }
     }
     
-    let files_to_process = if cli.group_by_type {
+    if cli.group_by_type {
         let grouped = group_files_by_type(files);
         for (group_name, group_files) in grouped {
             output.push_str(&format!("# {}\n\n", group_name));
@@ -552,13 +588,11 @@ fn format_output(files: &[(PathBuf, String)], format: &OutputFormat, cli: &Cli) 
             output.push('\n');
         }
         return output;
-    } else {
-        files
-    };
+    }
 
     match format {
         OutputFormat::Default => {
-            for (path, content) in files_to_process {
+            for (path, content) in files {
                 let processed_content = if cli.compress {
                     compress_content(content)
                 } else {
@@ -574,7 +608,7 @@ fn format_output(files: &[(PathBuf, String)], format: &OutputFormat, cli: &Cli) 
             }
         }
         OutputFormat::Markdown => {
-            for (path, content) in files_to_process {
+            for (path, content) in files {
                 let processed_content = if cli.compress {
                     compress_content(content)
                 } else {
@@ -599,7 +633,7 @@ fn format_output(files: &[(PathBuf, String)], format: &OutputFormat, cli: &Cli) 
             }
         }
         OutputFormat::Json => {
-            let files_json: Vec<serde_json::Value> = files_to_process.iter()
+            let files_json: Vec<serde_json::Value> = files.iter()
                 .map(|(path, content)| {
                     let processed_content = if cli.compress {
                         compress_content(content)
@@ -619,9 +653,9 @@ fn format_output(files: &[(PathBuf, String)], format: &OutputFormat, cli: &Cli) 
             let mut json_output = serde_json::json!({
                 "files": files_json,
                 "metadata": {
-                    "total_files": files_to_process.len(),
-                    "total_size": files_to_process.iter().map(|(_, c)| c.len()).sum::<usize>(),
-                    "total_tokens": files_to_process.iter().map(|(_, c)| estimate_tokens(c)).sum::<usize>(),
+                    "total_files": files.len(),
+                    "total_size": files.iter().map(|(_, c)| c.len()).sum::<usize>(),
+                    "total_tokens": files.iter().map(|(_, c)| estimate_tokens(c)).sum::<usize>(),
                 }
             });
             
@@ -671,11 +705,141 @@ fn should_unignore_file(path: &Path, unignore_patterns: &[Pattern], verbose: boo
     false
 }
 
-fn print_stats(files_data: &[(PathBuf, String)], total_size: usize, total_tokens: usize) {
+fn process_files_parallel(
+    file_paths: Vec<PathBuf>,
+    cli: &Cli,
+    max_size_bytes: usize,
+) -> Result<Vec<(PathBuf, String)>> {
+    let total_files = file_paths.len();
+    
+    if total_files == 0 {
+        return Ok(Vec::new());
+    }
+    
+    let multi_progress = MultiProgress::new();
+    let main_pb = multi_progress.add(ProgressBar::new(total_files as u64));
+    main_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    main_pb.set_message("Processing files...");
+    
+    let total_size = Arc::new(AtomicUsize::new(0));
+    let total_tokens = Arc::new(AtomicUsize::new(0));
+    
+    let results: Vec<_> = file_paths
+        .into_par_iter()
+        .filter_map(|file_path| {
+            let result = process_single_file(&file_path, cli);
+            main_pb.inc(1);
+            
+            match result {
+                Ok(Some((path, content))) => {
+                    let content_size = content.len();
+                    let content_tokens = estimate_tokens(&content);
+                    
+                    let current_size = total_size.load(Ordering::Relaxed);
+                    if current_size + content_size > max_size_bytes {
+                        if cli.verbose {
+                            main_pb.println(format!(
+                                "Warning: Skipping {} - would exceed size limit",
+                                path.display()
+                            ));
+                        }
+                        return None;
+                    }
+                    
+                    if let Some(max_tokens) = cli.max_tokens {
+                        let current_tokens = total_tokens.load(Ordering::Relaxed);
+                        if current_tokens + content_tokens > max_tokens {
+                            if cli.verbose {
+                                main_pb.println(format!(
+                                    "Warning: Skipping {} - would exceed token limit",
+                                    path.display()
+                                ));
+                            }
+                            return None;
+                        }
+                    }
+                    
+                    total_size.fetch_add(content_size, Ordering::Relaxed);
+                    total_tokens.fetch_add(content_tokens, Ordering::Relaxed);
+                    
+                    if cli.verbose {
+                        main_pb.println(format!(
+                            "✓ {} ({} bytes, ~{} tokens)",
+                            path.display(),
+                            content_size,
+                            content_tokens
+                        ));
+                    }
+                    
+                    Some((path, content))
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    if cli.verbose {
+                        main_pb.println(format!("✗ {}: {}", file_path.display(), e));
+                    }
+                    None
+                }
+            }
+        })
+        .collect();
+    
+    main_pb.finish_with_message("Complete!");
+    
+    let mut final_results = results;
+    final_results.sort_by(|a, b| a.0.cmp(&b.0));
+    
+    Ok(final_results)
+}
+
+fn process_single_file(file_path: &PathBuf, cli: &Cli) -> Result<Option<(PathBuf, String)>> {
+    if let Some(ref output_file) = cli.output_file {
+        if let (Ok(file_canonical), Ok(output_canonical)) = 
+            (file_path.canonicalize(), output_file.canonicalize()) {
+            if file_canonical == output_canonical {
+                return Ok(None);
+            }
+        }
+    }
+    
+    match fs::read_to_string(file_path) {
+        Ok(mut content) => {
+            if cli.exclude_empty && content.trim().is_empty() {
+                return Ok(None);
+            }
+
+            if content.starts_with('\u{FEFF}') {
+                content = content.trim_start_matches('\u{FEFF}').to_string();
+            }
+            content = content.replace("\r\n", "\n");
+            
+            Ok(Some((file_path.clone(), content)))
+        }
+        Err(e) => {
+            if let Ok(bytes) = fs::read(file_path) {
+                if is_likely_binary(&bytes) {
+                    Ok(None)
+                } else {
+                    Err(anyhow::anyhow!("Text file with encoding issues: {}", e))
+                }
+            } else {
+                Err(anyhow::anyhow!("Cannot read file: {}", e))
+            }
+        }
+    }
+}
+
+fn print_enhanced_stats(files_data: &[(PathBuf, String)], total_size: usize, total_tokens: usize) {
     let mut ext_counts: HashMap<String, usize> = HashMap::new();
     let mut ext_sizes: HashMap<String, usize> = HashMap::new();
     let mut ext_tokens: HashMap<String, usize> = HashMap::new();
     let mut total_lines = 0;
+    let mut total_chars = 0;
     
     for (path, content) in files_data {
         let ext = path.extension()
@@ -684,57 +848,55 @@ fn print_stats(files_data: &[(PathBuf, String)], total_size: usize, total_tokens
             .to_string();
         
         let tokens = estimate_tokens(content);
+        let lines = content.lines().count();
+        let chars = content.chars().count();
         
         *ext_counts.entry(ext.clone()).or_insert(0) += 1;
         *ext_sizes.entry(ext.clone()).or_insert(0) += content.len();
         *ext_tokens.entry(ext).or_insert(0) += tokens;
-        total_lines += content.lines().count();
+        total_lines += lines;
+        total_chars += chars;
     }
     
-    eprintln!("Total files: {}", files_data.len());
-    eprintln!("Total size: {:.1} KB", total_size as f64 / 1024.0);
-    eprintln!("Total tokens: ~{}", total_tokens);
-    eprintln!("Total lines: {}", total_lines);
-    eprintln!("\nBy file type:");
+    eprintln!("📊 PROCESSING COMPLETE");
+    eprintln!("Files: {} | Size: {:.1} KB | Tokens: ~{} | Lines: {} | Characters: {}", 
+             files_data.len(), 
+             total_size as f64 / 1024.0, 
+             total_tokens,
+             total_lines,
+             total_chars);
     
+    if total_chars > 0 {
+        let tokens_per_char = total_tokens as f64 / total_chars as f64;
+        eprintln!("Token density: {:.2} tokens/char", tokens_per_char);
+    }
+    
+    eprintln!("\n📁 BY FILE TYPE:");
     let mut ext_data: Vec<_> = ext_counts.iter().collect();
     ext_data.sort_by_key(|&(_, count)| std::cmp::Reverse(*count));
     
     for (ext, count) in ext_data {
         let size_kb = ext_sizes[ext] as f64 / 1024.0;
         let tokens = ext_tokens[ext];
-        eprintln!("  {}: {} files ({:.1} KB, ~{} tokens)", ext, count, size_kb, tokens);
+        let avg_tokens_per_file = if *count > 0 { tokens / count } else { 0 };
+        eprintln!("  {:12} {} files ({:6.1} KB, ~{:5} tokens, ~{}/file)", 
+                 format!("{}:", ext), count, size_kb, tokens, avg_tokens_per_file);
     }
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    
-    let output_file_canonical = if let Some(ref output_file) = cli.output_file {
-        output_file.canonicalize().ok()
-    } else {
-        None
-    };
-    
-    let mut files_data = Vec::new();
-    let mut total_size_bytes = 0usize;
-    let mut total_tokens = 0usize;
     let max_size_bytes = cli.max_size_mb * 1024 * 1024;
-    
+
     let unignore_patterns: Result<Vec<Pattern>, _> = cli.unignore
         .as_ref()
-        .map(|patterns| {
-            patterns.iter()
-                .map(|p| Pattern::new(p.trim()))
-                .collect()
-        })
+        .map(|patterns| patterns.iter().map(|p| Pattern::new(p.trim())).collect())
         .unwrap_or_else(|| Ok(Vec::new()));
-    
     let unignore_patterns = unignore_patterns.map_err(|e| anyhow::anyhow!("Invalid glob pattern: {}", e))?;
 
     let mut types_builder = TypesBuilder::new();
     types_builder.add_defaults();
-    
+
     if let Some(includes) = &cli.include {
         for ext in includes {
             let clean_ext = ext.trim().trim_start_matches('.');
@@ -754,172 +916,113 @@ fn main() -> Result<()> {
     }
     let types = types_builder.build()?;
 
-    for path in &cli.paths {
-        if cli.verbose {
-            eprintln!("Walking path: {}", path.display());
-        }
-
-        let mut walker = WalkBuilder::new(path);
-        walker
-            .max_depth(cli.depth)
-            .git_ignore(cli.use_gitignore)
-            .types(types.clone());
-
+    let all_file_paths = {
         let mut found_files = std::collections::HashSet::new();
 
-        for result in walker.build() {
-            let entry = match result {
-                Ok(e) => e,
-                Err(e) => {
-                    if cli.verbose {
-                        eprintln!("Warning: {}", e);
-                    }
-                    continue;
-                }
-            };
-            
-            if entry.file_type().map_or(false, |ft| ft.is_file()) {
-                let file_path = entry.path();
-                
-                if cli.auto_exclude_common && should_auto_exclude(file_path) {
-                    if cli.verbose {
-                        eprintln!("Auto-excluded: {}", file_path.display());
-                    }
-                    continue;
-                }
-                
-                found_files.insert(file_path.to_path_buf());
+        for path in &cli.paths {
+            if cli.verbose {
+                eprintln!("Walking path: {}", path.display());
             }
-        }
 
-        if !unignore_patterns.is_empty() {
-            let mut walker_no_ignore = WalkBuilder::new(path);
-            walker_no_ignore
+            let mut walker = WalkBuilder::new(path);
+            walker
                 .max_depth(cli.depth)
-                .git_ignore(false)
+                .git_ignore(cli.use_gitignore)
                 .types(types.clone());
 
-            for result in walker_no_ignore.build() {
+            for result in walker.build() {
                 let entry = match result {
                     Ok(e) => e,
                     Err(e) => {
-                        if cli.verbose {
-                            eprintln!("Warning: {}", e);
-                        }
+                        if cli.verbose { eprintln!("Warning: {}", e); }
                         continue;
                     }
                 };
                 
                 if entry.file_type().map_or(false, |ft| ft.is_file()) {
-                    let file_path = entry.path().to_path_buf();
+                    let file_path = entry.path();
+                    if cli.auto_exclude_common && should_auto_exclude(file_path) {
+                        if cli.verbose { eprintln!("Auto-excluded: {}", file_path.display()); }
+                        continue;
+                    }
+                    found_files.insert(file_path.to_path_buf());
+                }
+            }
+
+            if !unignore_patterns.is_empty() {
+                let mut walker_no_ignore = WalkBuilder::new(path);
+                walker_no_ignore
+                    .max_depth(cli.depth)
+                    .git_ignore(false)
+                    .types(types.clone());
+
+                for result in walker_no_ignore.build() {
+                    let entry = match result {
+                        Ok(e) => e,
+                        Err(e) => {
+                            if cli.verbose { eprintln!("Warning: {}", e); }
+                            continue;
+                        }
+                    };
                     
-                    if !found_files.contains(&file_path) {
-                        if should_unignore_file(&file_path, &unignore_patterns, cli.verbose) {
+                    if entry.file_type().map_or(false, |ft| ft.is_file()) {
+                        let file_path = entry.path().to_path_buf();
+                        if !found_files.contains(&file_path) && should_unignore_file(&file_path, &unignore_patterns, cli.verbose) {
                             found_files.insert(file_path);
                         }
                     }
                 }
             }
         }
+        
+        let mut paths: Vec<_> = found_files.into_iter().collect();
+        paths.sort();
+        paths
+    };
 
-        let mut file_paths: Vec<_> = found_files.into_iter().collect();
-        file_paths.sort();
+    if cli.dry_run {
+        let mut files_data = Vec::new();
+        let mut total_size_bytes = 0;
+        let mut total_tokens = 0;
 
-        for file_path in file_paths {
-            if let Some(ref output_canonical) = output_file_canonical {
-                if let Ok(file_canonical) = file_path.canonicalize() {
-                    if file_canonical == *output_canonical {
-                        if cli.verbose {
-                            eprintln!("Skipping output file: {}", file_path.display());
-                        }
-                        continue;
-                    }
+        for file_path in all_file_paths {
+            if let Ok(Some((path, content))) = process_single_file(&file_path, &cli) {
+                let content_size = content.len();
+                let content_tokens = estimate_tokens(&content);
+                if total_size_bytes + content_size > max_size_bytes { continue; }
+                if let Some(max_tokens) = cli.max_tokens {
+                    if total_tokens + content_tokens > max_tokens { continue; }
                 }
-            }
-
-            if cli.verbose {
-                eprintln!("Processing: {}", file_path.display());
-            }
-            
-            match fs::read_to_string(&file_path) {
-                Ok(mut content) => {
-                    if cli.exclude_empty && content.trim().is_empty() {
-                        if cli.verbose {
-                            eprintln!("Skipping empty file: {}", file_path.display());
-                        }
-                        continue;
-                    }
-
-                    if content.starts_with('\u{FEFF}') {
-                        content = content.trim_start_matches('\u{FEFF}').to_string();
-                    }
-                    
-                    content = content.replace("\r\n", "\n");
-                    
-                    let content_size = content.len();
-                    let content_tokens = estimate_tokens(&content);
-                    
-                    if total_size_bytes + content_size > max_size_bytes {
-                        eprintln!("Warning: Skipping {} - would exceed size limit of {}MB", 
-                                file_path.display(), cli.max_size_mb);
-                        continue;
-                    }
-                    
-                    if let Some(max_tokens) = cli.max_tokens {
-                        if total_tokens + content_tokens > max_tokens {
-                            eprintln!("Warning: Skipping {} - would exceed token limit of {}", 
-                                    file_path.display(), max_tokens);
-                            continue;
-                        }
-                    }
-                    
-                    total_size_bytes += content_size;
-                    total_tokens += content_tokens;
-                    files_data.push((file_path.clone(), content));
-                    
-                    if cli.verbose {
-                        eprintln!("Added: {} ({} bytes, ~{} tokens)", 
-                                file_path.display(), content_size, content_tokens);
-                    }
-                }
-                Err(e) => {
-                    if let Ok(bytes) = fs::read(&file_path) {
-                        if is_likely_binary(&bytes) {
-                            if cli.verbose {
-                                eprintln!("Skipping binary file: {}", file_path.display());
-                            }
-                        } else {
-                            eprintln!("Warning: File {} appears to be text but has encoding issues: {}", 
-                                    file_path.display(), e);
-                        }
-                    } else {
-                        eprintln!("Warning: Cannot read file {}: {}", file_path.display(), e);
-                    }
-                }
+                total_size_bytes += content_size;
+                total_tokens += content_tokens;
+                files_data.push((path, content));
             }
         }
-    }
 
-    if !files_data.is_empty() {
-        let formatted_output = format_output(&files_data, &cli.format, &cli);
-        let output_tokens = estimate_tokens(&formatted_output);
+        eprintln!("=== DRY RUN - Would process {} file(s) ({:.1} KB, ~{} tokens) ===", 
+                 files_data.len(), total_size_bytes as f64 / 1024.0, total_tokens);
         
-        if cli.dry_run {
-            eprintln!("=== DRY RUN - Would copy {} file(s) ({:.1} KB, ~{} tokens) ===", 
-                     files_data.len(), total_size_bytes as f64 / 1024.0, total_tokens);
+        for (path, content) in &files_data {
+            let lines = content.lines().count();
+            let tokens = estimate_tokens(content);
+            eprintln!("  {} ({} lines, {} bytes, ~{} tokens)", 
+                     path.display(), lines, content.len(), tokens);
+        }
+
+        if cli.stats {
+            eprintln!("\n=== STATISTICS ===");
+            print_enhanced_stats(&files_data, total_size_bytes, total_tokens);
+        }
+    } else {
+        let files_data = process_files_parallel(all_file_paths, &cli, max_size_bytes)?;
+        
+        if !files_data.is_empty() {
+            let total_size_bytes: usize = files_data.iter().map(|(_, c)| c.len()).sum();
+            let total_tokens: usize = files_data.iter().map(|(_, c)| estimate_tokens(c)).sum();
             
-            for (path, content) in &files_data {
-                let lines = content.lines().count();
-                let tokens = estimate_tokens(content);
-                eprintln!("  {} ({} lines, {} bytes, ~{} tokens)", 
-                         path.display(), lines, content.len(), tokens);
-            }
+            let formatted_output = format_output(&files_data, &cli.format, &cli);
+            let output_tokens = estimate_tokens(&formatted_output);
             
-            if cli.stats {
-                eprintln!("\n=== STATISTICS ===");
-                print_stats(&files_data, total_size_bytes, total_tokens);
-            }
-        } else {
             if let Some(output_file) = &cli.output_file {
                 if let Some(split_size_str) = &cli.split_by_size {
                     let split_size = parse_size(split_size_str)?;
@@ -933,23 +1036,25 @@ fn main() -> Result<()> {
                     file.write_all(formatted_output.as_bytes())?;
                     println!("Output written to: {}", output_file.display());
                 }
-                
-                eprintln!("Processed {} file(s) ({:.1} KB, ~{} tokens -> ~{} output tokens).", 
-                         files_data.len(), total_size_bytes as f64 / 1024.0, total_tokens, output_tokens);
             } else {
                 let mut clipboard = arboard::Clipboard::new()?;
                 clipboard.set_text(formatted_output)?;
-                eprintln!("Copied content of {} file(s) to clipboard ({:.1} KB, ~{} tokens -> ~{} output tokens).", 
-                         files_data.len(), total_size_bytes as f64 / 1024.0, total_tokens, output_tokens);
+                eprintln!("Copied content of {} file(s) to clipboard.", files_data.len());
             }
             
             if cli.stats {
                 eprintln!("\n=== STATISTICS ===");
-                print_stats(&files_data, total_size_bytes, total_tokens);
+                print_enhanced_stats(&files_data, total_size_bytes, total_tokens);
             }
+
+            eprintln!("📋 Processed {} file(s) ({:.1} KB, ~{} tokens -> ~{} output tokens)",
+                     files_data.len(), 
+                     total_size_bytes as f64 / 1024.0, 
+                     total_tokens, 
+                     output_tokens);
+        } else {
+            eprintln!("No files found matching the criteria.");
         }
-    } else {
-        eprintln!("No files found matching the criteria.");
     }
 
     Ok(())
