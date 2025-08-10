@@ -5,7 +5,7 @@ use std::io::Write;
 
 use anyhow::Result;
 use clap::Parser;
-use ignore::{WalkBuilder, types::TypesBuilder};
+use ignore::{WalkBuilder};
 use glob::Pattern;
 use serde_json::Value;
 
@@ -90,6 +90,64 @@ fn should_auto_exclude(path: &Path) -> bool {
     false
 }
 
+fn should_include_file(path: &Path, include_patterns: &[String]) -> bool {
+    if include_patterns.is_empty() {
+        return true;
+    }
+    
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    
+    for pattern in include_patterns {
+        if !pattern.contains('.') && extension == pattern {
+            return true;
+        }
+        
+        if file_name.as_ref() == pattern {
+            return true;
+        }
+        
+        if pattern.contains('*') || pattern.contains('?') {
+            if let Ok(glob_pattern) = Pattern::new(pattern) {
+                if glob_pattern.matches(&file_name) {
+                    return true;
+                }
+            }
+        }
+    }
+    
+    false
+}
+
+fn should_exclude_file(path: &Path, exclude_patterns: &[String]) -> bool {
+    if exclude_patterns.is_empty() {
+        return false;
+    }
+    
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    
+    for pattern in exclude_patterns {
+        if !pattern.contains('.') && extension == pattern {
+            return true;
+        }
+        
+        if file_name.as_ref() == pattern {
+            return true;
+        }
+        
+        if pattern.contains('*') || pattern.contains('?') {
+            if let Ok(glob_pattern) = Pattern::new(pattern) {
+                if glob_pattern.matches(&file_name) {
+                    return true;
+                }
+            }
+        }
+    }
+    
+    false
+}
+
 fn compress_content(content: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let mut result = String::new();
@@ -162,7 +220,6 @@ fn compress_content(content: &str) -> String {
     
     result
 }
-
 
 fn generate_directory_tree(paths: &[PathBuf], max_depth: Option<usize>) -> String {
     let mut tree = String::from("## Project Structure\n\n```\n");
@@ -358,11 +415,14 @@ EXAMPLES:
   # Copy all files from the current directory, respecting .gitignore
   fclip
 
-  # Copy only Rust and Toml files from the 'src' directory with structure
-  fclip --include rs,toml --include-structure ./src
+  # Copy only Rust files from the 'src' directory with structure
+  fclip --include rs --include-structure ./src
 
-  # Copy all files except .log and .tmp files, limit to 50k tokens
-  fclip --exclude log,tmp --max-tokens 50000 .
+  # Copy all markdown files except NOTE.md, limit to 50k tokens
+  fclip --include md --exclude NOTE.md --max-tokens 50000 .
+
+  # Copy all files except log files and temporary files
+  fclip --exclude log --exclude \"*.tmp\" --exclude \"temp*\" .
 
   # Output to file instead of clipboard, with dependencies info
   fclip --output-file codebase.txt --include-dependencies .
@@ -376,7 +436,7 @@ EXAMPLES:
     author,
     version,
     about = "A CLI tool to copy the contents of a codebase to the clipboard.",
-    long_about = "fclip walks the specified directory, collects the content of all relevant files, and copies it to the clipboard, formatted with file paths as headers. It intelligently respects .gitignore rules and allows for fine-grained filtering by file extension.",
+    long_about = "fclip walks the specified directory, collects the content of all relevant files, and copies it to the clipboard, formatted with file paths as headers. It intelligently respects .gitignore rules and allows for fine-grained filtering by file extension or filename.",
     after_help = AFTER_HELP
 )]
 struct Cli {
@@ -392,10 +452,10 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     unignore: Option<Vec<String>>,
 
-    #[arg(short, long, value_delimiter = ',')]
+    #[arg(short, long, value_delimiter = ',', help = "Include files by extension (e.g., 'rs', 'py') or filename (e.g., 'README.md', '*.txt')")]
     include: Option<Vec<String>>,
 
-    #[arg(short, long, value_delimiter = ',')]
+    #[arg(short, long, value_delimiter = ',', help = "Exclude files by extension (e.g., 'log', 'tmp') or filename (e.g., 'NOTE.md', '*.cache')")]
     exclude: Option<Vec<String>>,
 
     #[arg(long, short)]
@@ -481,7 +541,6 @@ fn parse_size(size_str: &str) -> Result<usize> {
         Ok(result)
     }
 }
-
 
 fn write_output_chunks(content: &str, output_file: &Path, chunk_size: usize, append: bool) -> Result<()> {
     if content.len() <= chunk_size {
@@ -760,28 +819,6 @@ fn main() -> Result<()> {
     
     let unignore_patterns = unignore_patterns.map_err(|e| anyhow::anyhow!("Invalid glob pattern: {}", e))?;
 
-    let mut types_builder = TypesBuilder::new();
-    types_builder.add_defaults();
-    
-    if let Some(includes) = &cli.include {
-        for ext in includes {
-            let clean_ext = ext.trim().trim_start_matches('.');
-            types_builder.add(clean_ext, &format!("*.{}", clean_ext))?;
-            types_builder.select(clean_ext);
-        }
-    } else {
-        types_builder.select("all");
-    }
-
-    if let Some(excludes) = &cli.exclude {
-        for ext in excludes {
-            let clean_ext = ext.trim().trim_start_matches('.');
-            types_builder.add(clean_ext, &format!("*.{}", clean_ext))?;
-            types_builder.negate(clean_ext);
-        }
-    }
-    let types = types_builder.build()?;
-
     for path in &cli.paths {
         if cli.verbose {
             eprintln!("Walking path: {}", path.display());
@@ -790,8 +827,7 @@ fn main() -> Result<()> {
         let mut walker = WalkBuilder::new(path);
         walker
             .max_depth(cli.depth)
-            .git_ignore(cli.use_gitignore)
-            .types(types.clone());
+            .git_ignore(cli.use_gitignore);
 
         let mut found_files = std::collections::HashSet::new();
 
@@ -824,8 +860,7 @@ fn main() -> Result<()> {
             let mut walker_no_ignore = WalkBuilder::new(path);
             walker_no_ignore
                 .max_depth(cli.depth)
-                .git_ignore(false)
-                .types(types.clone());
+                .git_ignore(false);
 
             for result in walker_no_ignore.build() {
                 let entry = match result {
@@ -854,6 +889,24 @@ fn main() -> Result<()> {
         file_paths.sort();
 
         for file_path in file_paths {
+            if let Some(ref include_patterns) = cli.include {
+                if !should_include_file(&file_path, include_patterns) {
+                    if cli.verbose {
+                        eprintln!("Excluded by include filter: {}", file_path.display());
+                    }
+                    continue;
+                }
+            }
+            
+            if let Some(ref exclude_patterns) = cli.exclude {
+                if should_exclude_file(&file_path, exclude_patterns) {
+                    if cli.verbose {
+                        eprintln!("Excluded by exclude filter: {}", file_path.display());
+                    }
+                    continue;
+                }
+            }
+
             if let Some(output_file) = &cli.output_file {
                 if let Some(ref output_canonical) = output_file_canonical {
                     if let Ok(file_canonical) = file_path.canonicalize() {
