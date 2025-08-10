@@ -102,11 +102,11 @@ fn should_include_file(path: &Path, include_patterns: &[String]) -> bool {
         if !pattern.contains('.') && extension == pattern {
             return true;
         }
-        
+
         if file_name.as_ref() == pattern {
             return true;
         }
-        
+
         if pattern.contains('*') || pattern.contains('?') {
             if let Ok(glob_pattern) = Pattern::new(pattern) {
                 if glob_pattern.matches(&file_name) {
@@ -131,7 +131,7 @@ fn should_exclude_file(path: &Path, exclude_patterns: &[String]) -> bool {
         if !pattern.contains('.') && extension == pattern {
             return true;
         }
-        
+
         if file_name.as_ref() == pattern {
             return true;
         }
@@ -595,6 +595,119 @@ fn format_output(files: &[(PathBuf, String)], format: &OutputFormat, cli: &Cli) 
         }
     }
     
+    if matches!(format, OutputFormat::Json) {
+        let files_json: Vec<serde_json::Value> = if cli.group_by_type {
+            let grouped = group_files_by_type(files);
+            let mut grouped_json = Vec::new();
+            
+            for (group_name, group_files) in grouped {
+                let group_files_json: Vec<serde_json::Value> = group_files.iter()
+                    .map(|(path, content)| {
+                        let processed_content = if cli.compress {
+                            compress_content(content)
+                        } else {
+                            content.to_string()
+                        };
+                        
+                        serde_json::json!({
+                            "path": path.to_string_lossy(),
+                            "content": processed_content,
+                            "tokens": estimate_tokens(&processed_content),
+                            "size": processed_content.len()
+                        })
+                    })
+                    .collect();
+                
+                grouped_json.push(serde_json::json!({
+                    "group": group_name,
+                    "files": group_files_json
+                }));
+            }
+            
+            grouped_json.into_iter()
+                .flat_map(|group| {
+                    if let Some(files_array) = group.get("files").and_then(|f| f.as_array()) {
+                        files_array.clone()
+                    } else {
+                        vec![]
+                    }
+                })
+                .collect()
+        } else {
+            files.iter()
+                .map(|(path, content)| {
+                    let processed_content = if cli.compress {
+                        compress_content(content)
+                    } else {
+                        content.clone()
+                    };
+                    
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "content": processed_content,
+                        "tokens": estimate_tokens(&processed_content),
+                        "size": processed_content.len()
+                    })
+                })
+                .collect()
+        };
+        
+        let mut json_output = serde_json::json!({
+            "files": files_json,
+            "metadata": {
+                "total_files": files.len(),
+                "total_size": files.iter().map(|(_, c)| c.len()).sum::<usize>(),
+                "total_tokens": files.iter().map(|(_, c)| estimate_tokens(c)).sum::<usize>(),
+                "grouped": cli.group_by_type
+            }
+        });
+        
+        if cli.group_by_type {
+            let grouped = group_files_by_type(files);
+            let groups_json: Vec<serde_json::Value> = grouped.into_iter()
+                .map(|(group_name, group_files)| {
+                    let group_files_json: Vec<serde_json::Value> = group_files.iter()
+                        .map(|(path, content)| {
+                            let processed_content = if cli.compress {
+                                compress_content(content)
+                            } else {
+                                content.to_string()
+                            };
+                            
+                            serde_json::json!({
+                                "path": path.to_string_lossy(),
+                                "content": processed_content,
+                                "tokens": estimate_tokens(&processed_content),
+                                "size": processed_content.len()
+                            })
+                        })
+                        .collect();
+                    
+                    serde_json::json!({
+                        "group": group_name,
+                        "file_count": group_files.len(),
+                        "files": group_files_json
+                    })
+                })
+                .collect();
+            
+            json_output["groups"] = serde_json::Value::Array(groups_json);
+        }
+        
+        if cli.include_structure {
+            json_output["structure"] = serde_json::Value::String(generate_directory_tree(&cli.paths, cli.depth));
+        }
+        
+        if cli.include_dependencies {
+            let deps = find_dependencies(&cli.paths);
+            if !deps.is_empty() {
+                json_output["dependencies"] = serde_json::Value::String(deps);
+            }
+        }
+        
+        return serde_json::to_string_pretty(&json_output).unwrap_or_else(|_| "Error formatting JSON".to_string());
+    }
+
     let files_to_process = if cli.group_by_type {
         let grouped = group_files_by_type(files);
         for (group_name, group_files) in grouped {
@@ -686,41 +799,7 @@ fn format_output(files: &[(PathBuf, String)], format: &OutputFormat, cli: &Cli) 
             }
         }
         OutputFormat::Json => {
-            let files_json: Vec<serde_json::Value> = files_to_process.iter()
-                .map(|(path, content)| {
-                    let processed_content = if cli.compress {
-                        compress_content(content)
-                    } else {
-                        content.clone()
-                    };
-                    
-                    serde_json::json!({
-                        "path": path.to_string_lossy(),
-                        "content": processed_content,
-                        "tokens": estimate_tokens(&processed_content),
-                        "size": processed_content.len()
-                    })
-                })
-                .collect();
-            
-            let mut json_output = serde_json::json!({
-                "files": files_json,
-                "metadata": {
-                    "total_files": files_to_process.len(),
-                    "total_size": files_to_process.iter().map(|(_, c)| c.len()).sum::<usize>(),
-                    "total_tokens": files_to_process.iter().map(|(_, c)| estimate_tokens(c)).sum::<usize>(),
-                }
-            });
-            
-            if cli.include_structure {
-                json_output["structure"] = serde_json::Value::String(generate_directory_tree(&cli.paths, cli.depth));
-            }
-            
-            if cli.include_dependencies {
-                json_output["dependencies"] = serde_json::Value::String(find_dependencies(&cli.paths));
-            }
-            
-            output = serde_json::to_string_pretty(&json_output).unwrap_or_else(|_| "Error formatting JSON".to_string());
+            output = "{}".to_string();
         }
     }
     
